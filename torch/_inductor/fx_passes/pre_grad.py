@@ -2,7 +2,7 @@
 import copy
 import itertools
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
@@ -18,7 +18,6 @@ from torch.nn import functional as F
 from torch.nn.utils.fusion import fuse_conv_bn_eval, fuse_conv_bn_weights
 
 from .. import config
-
 from ..fx_utils import matches_module_function_pattern
 from ..pattern_matcher import (
     init_once_fakemode,
@@ -29,6 +28,7 @@ from ..utils import is_cpu_device, pass_execution_and_save
 from .group_batch_fusion import group_batch_fusion_passes, PRE_GRAD_FUSIONS
 from .misc_patterns import numpy_compat_normalization
 from .split_cat import PRE_GRAD_PATTERNS
+
 
 log = logging.getLogger(__name__)
 
@@ -80,15 +80,8 @@ def remove_split_ops(graph, shape_prop):
     return None
 
 
-pattern_matcher_passes_aten: List[PatternMatcherPass] = [
-    remove_split_with_size_one_pass_aten,
-    merge_getitem_cat_pass_aten,
-    merge_stack_tahn_unbind_pass_aten,
-    merge_splits_pass_aten,
-    mutate_cat_pass_aten,
-    split_cat_pass_aten,
-    unbind_stack_pass_aten,
-]
+def fuse_chunk_reshape_unsqueeze_concat_pass(graph):
+    return None
 
 
 @init_once_fakemode
@@ -135,6 +128,12 @@ def pre_grad_passes(gm: torch.fx.GraphModule, example_inputs=None):
                 "[Pre grad(predispatch IR)]Apply normalization pass",
             )
             pass_execution_and_save(
+                fuse_chunk_reshape_unsqueeze_concat_pass,
+                gm,
+                example_inputs,
+                "[Pre grad(predispatch IR)] Apply fuse_chunk_reshape_unsqueeze_concat_pass",
+            )
+            pass_execution_and_save(
                 group_batch_fusion_passes,
                 gm,
                 example_inputs,
@@ -152,20 +151,6 @@ def pre_grad_passes(gm: torch.fx.GraphModule, example_inputs=None):
                 example_inputs,
                 "[Pre grad(predispatch IR)] Apply fuse_split_linear_add_pass",
             )
-
-            log.debug(
-                "[Pre grad(predispatch IR)]Before split cat in pre grad pass. graph: %s",
-                gm.graph,
-            )
-            for ind, pattern_matcher_pass_aten in enumerate(
-                pattern_matcher_passes_aten
-            ):
-                pass_execution_and_save(
-                    pattern_matcher_pass_aten.apply,
-                    gm,
-                    example_inputs,
-                    f"[Pre grad(predispatch IR)]Apply split_cat, index: {ind}",
-                )
             pass_execution_and_save(
                 remove_reshape_pass.apply,
                 gm,
@@ -341,7 +326,7 @@ def fuse_conv_bn(gm: torch.fx.GraphModule, inplace=False) -> torch.fx.GraphModul
             bn_eps=None,
             bn_weight=None,
             bn_bias=None,
-        ):
+        ) -> None:
             self.bn_nodes = [
                 bn_node,
             ]
