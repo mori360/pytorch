@@ -144,7 +144,8 @@ _XCCL_AVAILABLE = True
 
 try:
     # pyrefly: ignore [missing-import]
-    from torchcomms._comms import _BackendWrapper, new_comm
+    from torchcomms._backend_wrapper import _BackendWrapper
+    from torchcomms._comms import new_comm
 
     # pyrefly: ignore [missing-import]
     from torchcomms.hooks import FlightRecorderHook
