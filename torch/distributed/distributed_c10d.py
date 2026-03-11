@@ -145,6 +145,8 @@ _XCCL_AVAILABLE = True
 try:
     # pyrefly: ignore [missing-import]
     from torchcomms._backend_wrapper import _BackendWrapper
+
+    # pyrefly: ignore [missing-import]
     from torchcomms._comms import new_comm
 
     # pyrefly: ignore [missing-import]
