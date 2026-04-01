@@ -2,6 +2,7 @@
 
 #include <ATen/core/Tensor.h>
 #include <ATen/core/PhiloxRNGEngine.h>
+#include <ATen/CPUGeneratorImpl.h>
 #include <ATen/Dispatch.h>
 #include <ATen/native/PhiloxStatelessRNG.h>
 
@@ -131,7 +132,7 @@ Tensor _philox_key_fold_in_cpu(const Tensor& key, int64_t data) {
   return output;
 }
 
-Tensor& _philox_uniform_cpu_(Tensor& self, const Tensor& key, double low, double high) {
+Tensor& _philox_uniform_cpu_(Tensor& self, const Tensor& key, double low, double high, bool portable) {
   TORCH_CHECK(key.dim() >= 1 && key.size(-1) == 2,
       "_philox_uniform: key must have shape (*batch, 2), got shape ",
       key.sizes());
@@ -144,6 +145,17 @@ Tensor& _philox_uniform_cpu_(Tensor& self, const Tensor& key, double low, double
   TORCH_CHECK(self.device() == key.device(),
       "_philox_uniform: self and key must be on the same device, got ",
       self.device(), " and ", key.device());
+
+  if (!portable) {
+    TORCH_CHECK(key.dim() == 1 && key.size(0) == 2,
+        "_philox_uniform: portable=False does not support batched keys");
+    auto key_contig = key.contiguous();
+    const uint64_t* key_data = key_contig.const_data_ptr<uint64_t>();
+    auto gen = at::detail::createCPUGenerator(
+        key_data[0] ^ (key_data[1] * 0x9E3779B97F4A7C15ULL));
+    self.uniform_(low, high, gen);
+    return self;
+  }
 
   int64_t ndim = self.dim();
   int64_t elems_per_key = 1;
@@ -214,7 +226,7 @@ Tensor& _philox_uniform_cpu_(Tensor& self, const Tensor& key, double low, double
   return self;
 }
 
-Tensor& _philox_normal_cpu_(Tensor& self, const Tensor& key, double mean, double stddev) {
+Tensor& _philox_normal_cpu_(Tensor& self, const Tensor& key, double mean, double stddev, bool portable) {
   TORCH_CHECK(key.dim() >= 1 && key.size(-1) == 2,
       "_philox_normal: key must have shape (*batch, 2), got shape ",
       key.sizes());
@@ -227,6 +239,17 @@ Tensor& _philox_normal_cpu_(Tensor& self, const Tensor& key, double mean, double
   TORCH_CHECK(self.device() == key.device(),
       "_philox_normal: self and key must be on the same device, got ",
       self.device(), " and ", key.device());
+
+  if (!portable) {
+    TORCH_CHECK(key.dim() == 1 && key.size(0) == 2,
+        "_philox_normal: portable=False does not support batched keys");
+    auto key_contig = key.contiguous();
+    const uint64_t* key_data = key_contig.const_data_ptr<uint64_t>();
+    auto gen = at::detail::createCPUGenerator(
+        key_data[0] ^ (key_data[1] * 0x9E3779B97F4A7C15ULL));
+    self.normal_(mean, stddev, gen);
+    return self;
+  }
 
   int64_t ndim = self.dim();
   int64_t elems_per_key = 1;
