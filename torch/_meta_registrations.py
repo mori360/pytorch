@@ -491,6 +491,17 @@ def meta_rand_default(size, *, dtype=None, layout=None, device=None, pin_memory=
     )
 
 
+@register_meta(aten._philox_key_split.default)
+def meta_philox_key_split(key, num_splits):
+    batch_sizes = key.shape[:-1]
+    return key.new_empty((num_splits, *batch_sizes, 2))
+
+
+@register_meta(aten._philox_key_fold_in.default)
+def meta_philox_key_fold_in(key, data):
+    return torch.empty_like(key)
+
+
 @register_meta([aten._fft_c2r.default, aten._fft_c2r.out])
 @out_wrapper()
 def meta_fft_c2r(self: Tensor, dim: list[int], normalization: int, lastdim: int):
