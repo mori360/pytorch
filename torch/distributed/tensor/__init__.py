@@ -14,6 +14,7 @@ from torch.distributed.tensor._api import (
     randn,
     zeros,
 )
+from torch.distributed.tensor._random import use_stateless_rng
 from torch.distributed.tensor.placement_types import (
     Partial,
     Placement,
@@ -43,6 +44,7 @@ __all__ = [
     "rand",
     "randn",
     "zeros",
+    "use_stateless_rng",
 ]
 
 # For weights_only torch.load
@@ -86,6 +88,7 @@ full.__module__ = "torch.distributed.tensor"
 rand.__module__ = "torch.distributed.tensor"
 randn.__module__ = "torch.distributed.tensor"
 zeros.__module__ = "torch.distributed.tensor"
+use_stateless_rng.__module__ = "torch.distributed.tensor"
 
 # Register DTensor dispatch for higher order operators
 from torch._higher_order_ops.print import _register_dtensor_impl

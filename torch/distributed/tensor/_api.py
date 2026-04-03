@@ -4,10 +4,13 @@
 import copy
 import hashlib
 import inspect
+import logging
 import warnings
 from collections.abc import Callable, Sequence
 from typing import Any
 from typing_extensions import deprecated
+
+logger = logging.getLogger(__name__)
 
 import torch
 import torch.distributed.tensor._dispatch as op_dispatch
@@ -1221,13 +1224,41 @@ def _dtensor_init_helper(  # type: ignore[no-untyped-def]
         tensor_meta = TensorMeta(size, torch_stride, dtype)
         spec = DTensorSpec(device_mesh, tuple(placements), tensor_meta=tensor_meta)
 
-        if random.is_rng_supported_mesh(device_mesh) and not random._rng_tracker:
-            random._rng_tracker = random.OffsetBasedRNGTracker(device_mesh)
+        if random._use_stateless_rng:
+            import torch.func._random as stateless_random
 
-        if random._rng_tracker is None:
-            raise AssertionError
-        with random._rng_tracker._distribute_region(spec):
-            local_tensor = init_op(local_shape, **kwargs)
+            if not random._rng_tracker or not isinstance(
+                random._rng_tracker, random.StatelessRNGTracker
+            ):
+                random._rng_tracker = random.StatelessRNGTracker(device_mesh)
+            local_keys = random._rng_tracker._derive_key(spec, dtype)
+            init_name = "uniform" if init_op is torch.rand else "normal"
+            logger.debug(
+                "Stateless RNG init: op=%s, global_shape=%s, "
+                "local_shape=%s, op_counter=%d, placements=%s",
+                init_name,
+                size,
+                local_shape,
+                random._rng_tracker._op_counter,
+                placements,
+            )
+            if init_op is torch.rand:
+                local_tensor = stateless_random.uniform(
+                    local_keys, *local_shape, dtype=dtype
+                )
+            else:
+                local_tensor = stateless_random.normal(
+                    local_keys, *local_shape, dtype=dtype
+                )
+            random._rng_tracker._advance()
+        else:
+            if random.is_rng_supported_mesh(device_mesh) and not random._rng_tracker:
+                random._rng_tracker = random.OffsetBasedRNGTracker(device_mesh)
+
+            if random._rng_tracker is None:
+                raise AssertionError
+            with random._rng_tracker._distribute_region(spec):
+                local_tensor = init_op(local_shape, **kwargs)
     else:
         local_tensor = init_op(local_shape, **kwargs)
 

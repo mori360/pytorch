@@ -20,9 +20,28 @@ __all__ = [
     "is_rng_supported_mesh",
     "manual_seed",
     "OffsetBasedRNGTracker",
+    "StatelessRNGTracker",
+    "use_stateless_rng",
 ]
 
 _rng_tracker: Optional["_RNGStateTracker"] = None
+_use_stateless_rng: bool = False
+
+
+def use_stateless_rng(enabled: bool = True) -> None:
+    """Switch DTensor random ops between offset-based and stateless kernel.
+
+    When enabled, DTensor random ops use explicit Philox key-based generation
+    (``torch.func._random``) instead of manipulating the global RNG state.
+    Key derivation: ``fold_in(fold_in(root_key, op_counter), shard_linear_idx)``.
+
+    Args:
+        enabled (bool): If ``True``, use stateless kernels. If ``False`` (default),
+            use the existing offset-based RNG tracker.
+    """
+    global _use_stateless_rng
+    _use_stateless_rng = enabled
+    logger.info("DTensor stateless RNG %s", "enabled" if enabled else "disabled")
 
 
 def is_rng_supported_mesh(device_mesh: DeviceMesh) -> bool:
@@ -89,11 +108,7 @@ def manual_seed(seed: int, device_mesh: DeviceMesh) -> None:
     # )
     # Note: we still need to ensure setting `run_state_sync=False` to support the pp case
 
-    # instantiate a RNG tracker if haven't. By default DTensor uses an
-    # OffsetBasedRNGTracker to perform random operators.
     global _rng_tracker
-    if not _rng_tracker:
-        _rng_tracker = OffsetBasedRNGTracker(device_mesh, run_state_sync=False)
 
     if device_mesh.get_coordinate() is None:
         raise RuntimeError(
@@ -101,6 +116,18 @@ def manual_seed(seed: int, device_mesh: DeviceMesh) -> None:
             "otherwise DTensor RNG state on the rank will not be initialized and "
             "the behavior of DTensor random ops is undefined."
         )
+
+    if _use_stateless_rng:
+        if not _rng_tracker or not isinstance(_rng_tracker, StatelessRNGTracker):
+            _rng_tracker = StatelessRNGTracker(device_mesh, run_state_sync=False)
+        _rng_tracker._manual_seed(seed)
+        # Fall through to set the global seed as well — weight init and other
+        # non-DTensor random ops (e.g. torch.nn.init) depend on the global RNG.
+
+    # instantiate a RNG tracker if haven't. By default DTensor uses an
+    # OffsetBasedRNGTracker to perform random operators.
+    if not _rng_tracker:
+        _rng_tracker = OffsetBasedRNGTracker(device_mesh, run_state_sync=False)
 
     # DTensor no longer maintains a copy of rng state. manual seed on dtensor is the same thing
     # as manual seed on torch.
@@ -393,6 +420,107 @@ class OffsetBasedRNGTracker(_RNGStateTracker):
         self, shard_coord: Sequence[IntLikeType], shard_size: Sequence[IntLikeType]
     ) -> IntLikeType:
         return _calc_shard_linear_idx(shard_coord, shard_size)
+
+
+class StatelessRNGTracker(_RNGStateTracker):
+    """Stateless PRNG tracker using explicit key-based generation.
+
+    Uses ``torch.func._random`` Philox keys instead of manipulating the global
+    RNG state.  Key derivation per random op::
+
+        op_key    = fold_in(root_key, op_counter)
+        local_key = fold_in(op_key, shard_linear_idx)
+
+    Each shard gets an independent stream.  Replicated ranks share the same
+    ``shard_linear_idx`` (0) and therefore produce identical values.
+    """
+
+    def __init__(
+        self,
+        device_mesh: DeviceMesh,
+        run_state_sync: bool = True,
+    ):
+        super().__init__(_resolve_device(device_mesh=device_mesh))
+        if self._device.type == "cpu":
+            raise RuntimeError(
+                f"{self.__class__.__name__} requires a CUDA/CUDA-like device. "
+                f"Got {self._device.type}."
+            )
+        # Derive a shared seed across ranks.
+        seed = torch.randint(0, 2**63 - 1, (1,)).item()
+        if run_state_sync:
+            seed_tensor = torch.tensor(
+                [seed], dtype=torch.int64, device=self._device
+            )
+            torch.distributed.broadcast(seed_tensor, 0)
+            seed = seed_tensor.item()
+        import torch.func._random as stateless_random
+
+        self._root_key = stateless_random.key(seed, device=self._device)
+        self._op_counter: int = 0
+
+    def _manual_seed(self, seed: int) -> None:
+        import torch.func._random as stateless_random
+
+        self._root_key = stateless_random.key(seed, device=self._device)
+        self._op_counter = 0
+
+    def _derive_key(self, spec: DTensorSpec, dtype: torch.dtype) -> torch.Tensor:
+        """Derive per-rank stateless PRNG key(s) via ``unbind``.
+
+        Partitions the Philox stream so that ``cat(all shards)`` exactly
+        reconstructs the single-device output.  Returns a (possibly batched)
+        key tensor ready to pass to the generation function.
+        """
+        import torch.func._random as stateless_random
+
+        global_shape = spec.shape
+        mesh = spec.mesh
+
+        splits = [1] * len(global_shape)
+        shard_coords: list[int] = [0] * len(global_shape)
+        # Track mesh sizes contributed by _StridedShard per tensor dim.
+        # When a Shard follows a _StridedShard on the same dim, the Shard
+        # coord becomes the major (outer) index instead of the minor one.
+        strided_sizes: list[int] = [1] * len(global_shape)
+
+        for mesh_dim, placement in enumerate(spec.placements):
+            if isinstance(placement, _StridedShard):
+                dim = placement.dim
+                dim_size = mesh.size(mesh_dim)
+                coord = mesh._sym_get_coordinate(mesh_dim)
+                shard_coords[dim] = shard_coords[dim] * dim_size + coord
+                splits[dim] *= dim_size
+                strided_sizes[dim] *= dim_size
+            elif isinstance(placement, Shard):
+                dim = placement.dim
+                dim_size = mesh.size(mesh_dim)
+                coord = mesh._sym_get_coordinate(mesh_dim)
+                if strided_sizes[dim] > 1:
+                    # _StridedShard already contributed as the minor index;
+                    # this Shard goes in the major (outer) position.
+                    shard_coords[dim] = coord * strided_sizes[dim] + shard_coords[dim]
+                else:
+                    shard_coords[dim] = shard_coords[dim] * dim_size + coord
+                splits[dim] *= dim_size
+
+        op_key = stateless_random.fold_in(self._root_key, self._op_counter)
+        keys = stateless_random.unbind(
+            op_key, tuple(global_shape), tuple(splits), dtype=dtype
+        )
+        local_key = keys[tuple(shard_coords)]
+        # For N-D shapes, unbind returns per-row keys with shape
+        # (*tile_shape[:-1], 2). _philox_uniform_/_philox_normal_ expect
+        # batched keys of shape (*output_leading_dims, 2) where the leading
+        # dims are broadcastable. Unsqueezing before the key-pair dim makes
+        # the innermost output dimension broadcast from 1.
+        if local_key.ndim > 1:
+            local_key = local_key.unsqueeze(-2)
+        return local_key
+
+    def _advance(self) -> None:
+        """Increment the op counter so the next random op gets a different key."""
+        self._op_counter += 1
 
 
 def _calc_first_shard_size(spec: DTensorSpec) -> list[int]:
